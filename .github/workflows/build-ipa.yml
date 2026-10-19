@@ -1,0 +1,88 @@
+# Build an unsigned IPA of the iOS app on a GitHub-hosted macOS runner.
+#
+# Why unsigned: the IPA is re-signed on Windows by a sideloading tool (Sideloadly /
+# AltStore) with your own Apple ID, so no certificate, provisioning profile or
+# DEVELOPMENT_TEAM is needed here. The project is built as-is:
+#   * ios/Config/Shared.xcconfig includes Local.xcconfig with "#include?" (optional),
+#   * IA_ENTITLEMENTS / IA_WIDGET_ENTITLEMENTS are empty, so no entitlements are applied
+#     (those need a paid Apple developer account anyway).
+#
+# Result: an "IPhoneAgent-unsigned" artifact containing Payload/IPhoneAgent.app that you
+# download and sideload onto the iPhone. Every 7 days just re-sideload - no rebuild needed.
+name: Build IPA (unsigned)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/build-ipa.yml'
+
+jobs:
+  ipa:
+    # the author's CI uses macos-26; switch to macos-15 if that image is unavailable
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          echo "---"
+          xcodebuild -project IPhoneAgent.xcodeproj -list
+
+      - name: Build (device, unsigned)
+        run: |
+          set -o pipefail
+          # The scheme's test target is not needed here: only the app (and its widget).
+          xcodebuild \
+            -project IPhoneAgent.xcodeproj \
+            -scheme IPhoneAgent \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build.log
+
+      - name: Package IPA
+        run: |
+          APP="build/Build/Products/Release-iphoneos/IPhoneAgent.app"
+          test -d "$APP" || { echo "app bundle missing:"; ls -R build/Build/Products | head -50; exit 1; }
+
+          # an unsigned bundle still carries stale signatures from the asset catalog
+          rm -rf "$APP/_CodeSignature" "$APP/embedded.mobileprovision"
+
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload IPhoneAgent-unsigned.ipa
+
+          echo "--- IPA ---"
+          ls -lh IPhoneAgent-unsigned.ipa
+          echo "--- Payload ---"
+          find Payload -maxdepth 2 | head -20
+          echo "--- bundle id ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "Payload/IPhoneAgent.app/Info.plist"
+          echo "--- minimum iOS ---"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "Payload/IPhoneAgent.app/Info.plist"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPhoneAgent-unsigned-ipa
+          path: ios/IPhoneAgent-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ios/build.log
+          if-no-files-found: ignore
